@@ -222,6 +222,7 @@ def transformers_backend(model: str, temperature: float, max_tokens: int = 3000)
                 temperature=temperature if do_sample else None,
                 top_p=0.95 if do_sample else None,
                 pad_token_id=tok.pad_token_id or tok.eos_token_id,
+                eos_token_id=tok.convert_tokens_to_ids("<|im_end|>"),
             )
         text = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         return text
