@@ -189,31 +189,57 @@ def openai_backend(model: str, base_url: str, temperature: float, max_tokens: in
 
 def transformers_backend(model: str, temperature: float, max_tokens: int = 3000):
     """In-process HF generation. No server, no vLLM -- uses the same torch +
-    transformers that trained the model. Slow relative to vLLM, but for a few
-    hundred short episodes on a 3B it is minutes, and it sidesteps the entire
-    serving stack. The model path is a local dir (e.g. the merged adapter)."""
+    transformers that trained the model.
+
+    The SFT model was trained with a template whose end-of-turn token was never
+    in the loss mask, so it never learned to EMIT <|im_end|> to stop -- it runs
+    straight on, hallucinating the tool results and the rest of the conversation
+    in a single generation. eos_token_id cannot fix that: the model does not
+    produce the token to stop on.
+
+    So we stop STRUCTURALLY: halt as soon as one complete ```json ... ``` fence
+    has closed. That is exactly one tool call, which is what a turn should be.
+    The harness then runs it against the real Env and feeds the real result
+    back, forcing the model to take turns instead of soliloquising.
+    """
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
     tok = AutoTokenizer.from_pretrained(model)
     lm = AutoModelForCausalLM.from_pretrained(
         model, torch_dtype=torch.bfloat16, device_map="cuda"
     )
     lm.eval()
-    # Serve with the base Qwen chat template, NOT the training template: the
-    # {% generation %} markers are only for loss masking and confuse generation.
     if "generation %}" in (tok.chat_template or ""):
-        from transformers import AutoTokenizer as _T
-        tok.chat_template = _T.from_pretrained("Qwen/Qwen2.5-3B-Instruct").chat_template
+        tok.chat_template = AutoTokenizer.from_pretrained(
+            "Qwen/Qwen2.5-3B-Instruct"
+        ).chat_template
 
     do_sample = temperature > 0
 
+    class StopOnClosedFence(StoppingCriteria):
+        """Stop once the generated text contains a closing ``` that follows an
+        opening ```json -- i.e. one complete tool-call block."""
+
+        def __init__(self, prompt_len: int):
+            self.prompt_len = prompt_len
+
+        def __call__(self, input_ids, scores, **kw) -> bool:
+            gen = tok.decode(input_ids[0][self.prompt_len:], skip_special_tokens=True)
+            if "```" not in gen:
+                return False
+            # opened a json fence and closed a fence after it
+            open_i = gen.find("```json")
+            if open_i == -1:
+                open_i = gen.find("```")
+            close_i = gen.find("```", open_i + 3)
+            return close_i != -1
+
     def call(messages: list[dict]) -> str:
         chat = [{"role": "system", "content": SYSTEM}] + messages
-        prompt = tok.apply_chat_template(
-            chat, tokenize=False, add_generation_prompt=True
-        )
+        prompt = tok.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
         inputs = tok(prompt, return_tensors="pt").to(lm.device)
+        plen = inputs["input_ids"].shape[1]
         with torch.no_grad():
             out = lm.generate(
                 **inputs,
@@ -222,12 +248,21 @@ def transformers_backend(model: str, temperature: float, max_tokens: int = 3000)
                 temperature=temperature if do_sample else None,
                 top_p=0.95 if do_sample else None,
                 pad_token_id=tok.pad_token_id or tok.eos_token_id,
-                eos_token_id=tok.convert_tokens_to_ids("<|im_end|>"),
+                stopping_criteria=StoppingCriteriaList([StopOnClosedFence(plen)]),
             )
-        text = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        text = tok.decode(out[0][plen:], skip_special_tokens=True)
+        # Trim to the first complete fence so nothing past the first call leaks.
+        open_i = text.find("```json")
+        if open_i == -1:
+            open_i = text.find("```")
+        if open_i != -1:
+            close_i = text.find("```", open_i + 3)
+            if close_i != -1:
+                text = text[: close_i + 3]
         return text
 
     return call
+
 
 
 # --- episode ----------------------------------------------------------------
