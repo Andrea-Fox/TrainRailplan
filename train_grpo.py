@@ -136,7 +136,7 @@ def rollout(model, tok, env: Env, inst: dict, max_calls: int,
         ids = torch.cat([ids, obs_ids])
         mask = torch.cat([mask, torch.zeros_like(obs_ids)])
 
-        if ids.shape[0] > 7000:      # hard context guard for 24GB
+        if ids.shape[0] > 3000:      # hard context guard: backward must fit 24GB
             error = "context overflow"
             break
 
@@ -169,11 +169,19 @@ def trim_to_first_fence(tok, new_ids: torch.Tensor, text: str):
 
 
 def token_logprobs(model, ids: torch.Tensor, device) -> torch.Tensor:
-    """Per-token log-prob of ids[1:] under model, shape (T-1,)."""
+    """Per-token log-prob of ids[1:] under model, shape (T-1,).
+
+    Avoids materialising a (T-1, V) fp32 log-softmax -- with V=151k that tensor
+    alone is gigabytes and OOMs the backward. Instead: logprob = logit_target -
+    logsumexp(logits), computed per position in the model's own dtype. Only the
+    target-token logit is gathered; the full distribution is never stored.
+    """
     ids = ids.to(device).unsqueeze(0)
-    logits = model(ids).logits[0, :-1]                 # (T-1, V)
-    logp = F.log_softmax(logits.float(), dim=-1)
-    return logp.gather(1, ids[0, 1:].unsqueeze(1)).squeeze(1)   # (T-1,)
+    logits = model(ids).logits[0, :-1]                 # (T-1, V), bf16
+    targets = ids[0, 1:]                               # (T-1,)
+    tgt_logit = logits.gather(1, targets.unsqueeze(1)).squeeze(1)  # (T-1,)
+    lse = torch.logsumexp(logits, dim=-1)              # (T-1,)
+    return tgt_logit - lse
 
 
 def grpo_step(model, tok, episodes: list[Episode], kl_coef: float, device):
@@ -200,19 +208,23 @@ def grpo_step(model, tok, episodes: list[Episode], kl_coef: float, device):
             with model.disable_adapter():               # reference = base
                 logp_ref = token_logprobs(model, ids, device)
 
-        # policy-gradient surrogate: -A * logp, per assistant token
+        n_tok = int(m.sum().item())
+        # policy-gradient surrogate + per-token KL to reference, on assistant
+        # tokens only. Backward PER EPISODE so only one graph is live at a time
+        # (accumulating over the group would hold k graphs and OOM). Scale by
+        # 1/(k*n_tok) here so the accumulated gradient matches a group mean.
         pg = -(a.to(device) * logp * m).sum()
-        # KL(policy || ref) approx, per assistant token
         kl = ((logp - logp_ref) * m).sum()
-        total_loss = total_loss + pg + kl_coef * kl
+        loss_e = (pg + kl_coef * kl) / (len(episodes) * max(n_tok, 1))
+        loss_e.backward()
+
+        total_loss += loss_e.item()
         total_kl += kl.item()
-        total_tokens += int(m.sum().item())
+        total_tokens += n_tok
 
     if total_tokens == 0:
         return None
-    loss = total_loss / total_tokens
-    loss.backward()
-    return {"loss": loss.item(), "kl": total_kl / max(total_tokens, 1),
+    return {"loss": total_loss, "kl": total_kl / max(total_tokens, 1),
             "reward_mean": rewards.mean().item(), "reward_std": rewards.std().item(),
             "solve_rate": sum(e.solved for e in episodes) / len(episodes)}
 
@@ -260,6 +272,10 @@ def main():
     # load the SFT adapter as the trainable policy; reference = adapter disabled
     model = PeftModel.from_pretrained(base, args.adapter, is_trainable=True)
     model.print_trainable_parameters()
+    # trade compute for memory: recompute activations in backward instead of
+    # storing them. Essential to fit a long-episode backward pass on 24GB.
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
 
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=args.lr
