@@ -187,6 +187,48 @@ def openai_backend(model: str, base_url: str, temperature: float, max_tokens: in
     return call
 
 
+def transformers_backend(model: str, temperature: float, max_tokens: int = 3000):
+    """In-process HF generation. No server, no vLLM -- uses the same torch +
+    transformers that trained the model. Slow relative to vLLM, but for a few
+    hundred short episodes on a 3B it is minutes, and it sidesteps the entire
+    serving stack. The model path is a local dir (e.g. the merged adapter)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model)
+    lm = AutoModelForCausalLM.from_pretrained(
+        model, torch_dtype=torch.bfloat16, device_map="cuda"
+    )
+    lm.eval()
+    # Serve with the base Qwen chat template, NOT the training template: the
+    # {% generation %} markers are only for loss masking and confuse generation.
+    if "generation %}" in (tok.chat_template or ""):
+        from transformers import AutoTokenizer as _T
+        tok.chat_template = _T.from_pretrained("Qwen/Qwen2.5-3B-Instruct").chat_template
+
+    do_sample = temperature > 0
+
+    def call(messages: list[dict]) -> str:
+        chat = [{"role": "system", "content": SYSTEM}] + messages
+        prompt = tok.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True
+        )
+        inputs = tok(prompt, return_tensors="pt").to(lm.device)
+        with torch.no_grad():
+            out = lm.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=do_sample,
+                temperature=temperature if do_sample else None,
+                top_p=0.95 if do_sample else None,
+                pad_token_id=tok.pad_token_id or tok.eos_token_id,
+            )
+        text = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        return text
+
+    return call
+
+
 # --- episode ----------------------------------------------------------------
 
 
@@ -305,7 +347,7 @@ def main():
     ap.add_argument("--k", type=int, default=4, help="rollouts per instance")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--model", default="claude-sonnet-5")
-    ap.add_argument("--backend", choices=["anthropic", "openai"], default="anthropic")
+    ap.add_argument("--backend", choices=["anthropic", "openai", "transformers"], default="anthropic")
     ap.add_argument("--base-url", default="http://localhost:8000/v1")
     ap.add_argument("--max-calls", type=int, default=MAX_CALLS)
     ap.add_argument("--out", default="headroom.jsonl")
@@ -318,11 +360,12 @@ def main():
     env = Env(World(snap), snap)
     rows = [json.loads(l) for l in Path(args.instances).open()][: args.n]
 
-    call_model = (
-        anthropic_backend(args.model, args.temperature)
-        if args.backend == "anthropic"
-        else openai_backend(args.model, args.base_url, args.temperature)
-    )
+    if args.backend == "anthropic":
+        call_model = anthropic_backend(args.model, args.temperature)
+    elif args.backend == "transformers":
+        call_model = transformers_backend(args.model, args.temperature)
+    else:
+        call_model = openai_backend(args.model, args.base_url, args.temperature)
 
     results = []
     with Path(args.out).open("w") as f:
