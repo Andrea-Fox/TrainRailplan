@@ -1,0 +1,56 @@
+{
+  "source_zip": "/home/afox/Dropbox/TrainRailplan/gtfs.zip",
+  "service_date": "2026-07-14",
+  "min_transfer_sec": 180,
+  "frozen_at": "2026-07-10T12:19:35",
+  "counts": {
+    "routes": 2743,
+    "trips": 8833,
+    "stops": 2838,
+    "stations": 2488,
+    "stop_times": 99848
+  },
+  "repaired": {
+    "midnight_wrap_unwrapped_trips": 74,
+    "unwrapped_then_dropped": 0,
+    "stops_without_coords": 38,
+    "stops_geolocatable": 2800,
+    "stops_outside_cz_bounds": 0,
+    "names_spanning_multiple_stations": 0,
+    "stop_ids": 2838,
+    "stations_after_collapse": 2488,
+    "n_components": 4,
+    "largest_component_stations": 2466,
+    "largest_component_frac": 0.9912
+  },
+  "dropped": {
+    "routes": [
+      {
+        "n": 4710,
+        "why": "route_type != 2 (rail)"
+      }
+    ],
+    "trips": [
+      {
+        "n": 371429,
+        "why": "route not rail"
+      },
+      {
+        "n": 29352,
+        "why": "service inactive on 2026-07-14"
+      }
+    ],
+    "stop_times": [
+      {
+        "n": 7094628,
+        "why": "trip not retained"
+      }
+    ],
+    "stops": [
+      {
+        "n": 90136,
+        "why": "no rail service on this date"
+      }
+    ]
+  }
+}
