@@ -369,6 +369,118 @@ def _(e):
     )
 
 
+# --- navigational distance signal -------------------------------------------
+
+
+@case("signal: departures show km-to-dest for each terminus when dest is set")
+def _(e):
+    e.set_destination("HB")
+    out = e.departures("P", "00:00")
+    assert "here_km_to_dest" in out, out
+    assert any("terminus_km_to_dest" in r for r in out["departures"]), out
+    e.set_destination(None)
+
+
+@case("signal: no distance fields when destination is unset")
+def _(e):
+    e.set_destination(None)
+    out = e.departures("P", "00:00")
+    assert "here_km_to_dest" not in out
+    assert all("terminus_km_to_dest" not in r for r in out["departures"])
+
+
+@case("signal: leg reports how far the alight station is from the destination")
+def _(e):
+    e.set_destination("HB")
+    r = e.leg("T1", "P", "K")
+    assert "to_km_to_dest" in r, r
+    # K (lon 14.5) is closer to HB (15.6) than P (14.0) is: progress shows.
+    assert r["to_km_to_dest"] < e.w.distance_km("P", "HB")
+    e.set_destination(None)
+
+
+# --- potential-based shaping ------------------------------------------------
+
+
+@case("shaping: reaching the destination gives the full positive shaping")
+def _(e):
+    e.set_destination("HB")
+    s = e._shaping([Leg("T1", "P", "K"), Leg("T2", "K", "HB")])  # ends AT HB
+    from env import SHAPE_SCALE
+    assert abs(s - SHAPE_SCALE) < 1e-9, s
+    e.set_destination(None)
+
+
+@case("shaping: a loop returning to origin nets zero (telescoping)")
+def _(e):
+    e.set_destination("HB")
+    # Ends where it began (P): dist unchanged, shaping must be ~0 regardless of
+    # any wandering in between. This is the anti-hacking property.
+    s = e._shaping([Leg("T1", "P", "K"), Leg("Tback", "K", "P")])
+    assert abs(s) < 1e-9, s
+    e.set_destination(None)
+
+
+@case("shaping: depends only on endpoints, not the path length")
+def _(e):
+    e.set_destination("HB")
+    # Two chains with the SAME origin (P) and SAME end (K) -> identical shaping,
+    # however many legs. Cannot be farmed by adding detours that return.
+    a = e._shaping([Leg("T1", "P", "K")])
+    b = e._shaping([Leg("T1", "P", "K"), Leg("Tx", "K", "P"), Leg("T1", "P", "K")])
+    assert abs(a - b) < 1e-9, (a, b)
+    e.set_destination(None)
+
+
+@case("shaping: ending farther from the goal is negative")
+def _(e):
+    e.set_destination("P")   # goal is the western end
+    # Start at K (east of P) and go to Pa (farther east): moves AWAY from P, so
+    # d1 > d0 and shaping is negative. (Starting at P itself would give d0=0,
+    # which the helper treats as no-signal -- the origin is never the goal in a
+    # real instance.)
+    s = e._shaping([Leg("T2", "K", "Pa")])
+    assert s < 0, s
+    e.set_destination(None)
+
+
+@case("shaping: never lets an infeasible submission outrank a feasible one")
+def _(e):
+    from env import INFEASIBLE_BASE, INFEASIBLE_CREDIT, SHAPE_SCALE
+    # The cap must hold for the theoretical worst case: max partial progress
+    # (1.0) AND max shaping (SHAPE_SCALE) simultaneously. Assert the numeric
+    # invariant the cap guarantees -- the infeasible ceiling stays below the
+    # feasible floor (0.0) -- rather than hoping a fixture input hits the corner.
+    uncapped_bonus = INFEASIBLE_CREDIT * 1.0 + SHAPE_SCALE
+    capped_bonus = min(uncapped_bonus, INFEASIBLE_BASE - 0.05)
+    ceiling = -INFEASIBLE_BASE + capped_bonus       # best infeasible, budget=0
+    assert ceiling < 0.0, ceiling
+    # and that the cap is actually doing work (uncapped would breach 0)
+    assert -INFEASIBLE_BASE + uncapped_bonus >= 0.0, "cap is not needed -- retune"
+
+    e.set_destination("HB")
+    best_infeasible = e.score(
+        [Leg("T1", "P", "K"), Leg("T2", "Pa", "HB")], C(arrive_before=h(11)), 0
+    ).reward
+    worst_feasible = e.score(
+        [Leg("T1", "P", "K"), Leg("T2", "K", "HB")], C(arrive_before=h(5)), 0
+    ).reward
+    assert best_infeasible < worst_feasible, (best_infeasible, worst_feasible)
+    e.set_destination(None)
+
+
+@case("shaping: off when destination has no coordinates")
+def _(e):
+    e.set_destination("HB")
+    # legs whose endpoints exist but pretend dest is coord-less: force via a
+    # station id not in the coordinate table.
+    s = e._shaping([Leg("T1", "P", "K")])
+    e.set_destination("NOWHERE")
+    s2 = e._shaping([Leg("T1", "P", "K")])
+    assert s2 == 0.0, s2
+    e.set_destination(None)
+
+
 def main():
     tmp = Path(tempfile.mkdtemp())
     try:
@@ -378,12 +490,18 @@ def main():
         ids = list(NAMES)
         comp = {i: 0 for i in ids}
         comp["C2"] = 1  # Čáslav město is stranded on a branch
+        # Distinct coordinates along a rough west->east line so distance-to-dest
+        # is meaningful. Longitude increases with the natural travel direction;
+        # HB (Havlíčkův Brod) is the eastern destination in the shaping tests.
+        lon = {"P": 14.0, "K": 14.5, "Pa": 15.0, "HB": 15.6, "C1": 14.6,
+               "C2": 14.7, "PK": 14.3}
+        lat = {s: 50.0 for s in ids}
         pd.DataFrame(
             {
                 "station_id": ids,
                 "stop_name": [NAMES[i] for i in ids],
-                "stop_lat": [50.0] * len(ids),
-                "stop_lon": [14.0] * len(ids),
+                "stop_lat": [lat.get(i, 50.0) for i in ids],
+                "stop_lon": [lon.get(i, 14.0) for i in ids],
                 "geolocatable": [True] * len(ids),
                 "n_stop_ids": [1] * len(ids),
                 "component": [comp[i] for i in ids],

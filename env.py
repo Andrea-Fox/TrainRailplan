@@ -71,6 +71,17 @@ GIVE_UP_PENALTY = 0.5
 INFEASIBLE_BASE = 0.3
 INFEASIBLE_CREDIT = 0.2  # -INFEASIBLE_BASE + INFEASIBLE_CREDIT < 0.0, always
 
+# Potential-based shaping (Ng, Harada & Russell 1999). Phi(s) = -distance(s,dest).
+# The shaping over a chain of legs telescopes to Phi(alight_last) - Phi(origin),
+# i.e. it depends ONLY on how far the journey's endpoints are from the goal, not
+# on the path taken. This is what makes it unhackable: a loop returns to where it
+# started and nets zero shaping; a dead-end branch that ends far from the goal
+# nets NEGATIVE shaping. Only sustained progress toward the destination pays, and
+# only measured at the endpoints -- the agent cannot farm it by inching closer
+# and back. Scaled small (SHAPE_SCALE) so it guides without overturning the tier
+# ordering: it never lets an infeasible submission outrank a feasible one.
+SHAPE_SCALE = 0.15  # max shaping magnitude, as a fraction of a normalized trip
+
 
 def partial_progress(legs: list[Leg], world: World) -> float:
     """Fraction of the proposed chain that validates before the first break.
@@ -186,6 +197,18 @@ class Env:
         # trains actually leave from.
         self.service = {s: len(v) for s, v in self.boardings.items()}
 
+        # Episode destination, for the km-to-destination navigational signal.
+        # Set per episode via set_destination(); None means the signal is off
+        # (e.g. during unit tests that don't exercise navigation).
+        self._dest: str | None = None
+
+    def set_destination(self, dest_id: str | None) -> None:
+        """Call at episode start. The distance signal in departures() and leg()
+        is measured to this station. The destination is stated in the request,
+        so surfacing distance to it is fair -- it tells the policy nothing it
+        was not already given, only does the arithmetic it cannot do itself."""
+        self._dest = dest_id
+
     # --- tools ------------------------------------------------------------
 
     def find_station(self, query: str, limit: int = 5) -> dict:
@@ -251,23 +274,35 @@ class Env:
                 continue
             calls = self.w.calls(tid)
             last = max(calls.items(), key=lambda kv: kv[1][0])
-            rows.append(
-                {
-                    "trip_id": tid,
-                    "departs": hhmm(dep),
-                    "towards": self.names[last[0]],
-                    "final_arrival": hhmm(last[1][1]),
-                }
-            )
+            row = {
+                "trip_id": tid,
+                "departs": hhmm(dep),
+                "towards": self.names[last[0]],
+                "final_arrival": hhmm(last[1][1]),
+            }
+            # Navigational signal: how far this train's terminus is from the
+            # destination. Lower means the train heads goalward -- a heuristic
+            # to rank candidates, NOT a guarantee (a nearer terminus may be a
+            # dead-end branch with no onward service).
+            if self._dest is not None:
+                d = self.w.distance_km(last[0], self._dest)
+                if d is not None:
+                    row["terminus_km_to_dest"] = round(d, 1)
+            rows.append(row)
             if len(rows) >= limit:
                 break
 
-        return {
+        out = {
             "station": self.names[station_id],
             "after": after,
             "departures": rows,
             "truncated": len(rows) >= limit,
         }
+        if self._dest is not None:
+            here = self.w.distance_km(station_id, self._dest)
+            if here is not None:
+                out["here_km_to_dest"] = round(here, 1)
+        return out
 
     def leg(self, trip_id: str, board: str, alight: str) -> dict:
         """Times for riding one trip between two stations, or why you can't."""
@@ -290,7 +325,7 @@ class Env:
             (s for s, (seq, _, _) in calls.items() if b_seq < seq < a_seq),
             key=lambda s: calls[s][0],
         )
-        return {
+        result = {
             "trip_id": trip_id,
             "departs": hhmm(b_dep),
             "arrives": hhmm(a_arr),
@@ -298,6 +333,13 @@ class Env:
             "to": self.names[alight],
             "calls_at": [self.names[s] for s in via],
         }
+        # Did this hop get closer? Show the alight station's distance to the
+        # destination so the policy can judge progress against where it was.
+        if self._dest is not None:
+            d = self.w.distance_km(alight, self._dest)
+            if d is not None:
+                result["to_km_to_dest"] = round(d, 1)
+        return result
 
     # --- episode ----------------------------------------------------------
 
@@ -314,6 +356,31 @@ class Env:
             return {"error": f"unknown tool {tool!r}"}
         except TypeError as e:
             return {"error": f"bad arguments for {tool}: {e}"}
+
+    def _shaping(self, legs: list[Leg]) -> float:
+        """Telescoped potential-based shaping, in [-SHAPE_SCALE, +SHAPE_SCALE].
+
+        Phi(s) = -distance(s, dest). The per-leg shaping sums to
+        Phi(alight_last) - Phi(board_first) = dist(origin,dest) - dist(end,dest),
+        normalized by dist(origin,dest) so it is scale-free across journeys:
+
+            +SHAPE_SCALE  the chain ends AT the destination (full progress)
+             0            it ends as far from the goal as it began
+            -SHAPE_SCALE  it ends twice as far (wandered backwards), clipped
+
+        Depends only on the endpoints, so loops and detours net nothing. Returns
+        0 when the destination or an endpoint lacks coordinates -- shaping is a
+        guide, never a requirement.
+        """
+        if self._dest is None or not legs:
+            return 0.0
+        origin, end = legs[0].board, legs[-1].alight
+        d0 = self.w.distance_km(origin, self._dest)
+        d1 = self.w.distance_km(end, self._dest)
+        if d0 is None or d1 is None or d0 < 1e-6:
+            return 0.0
+        frac = (d0 - d1) / d0            # 1 at the goal, 0 no progress, <0 backwards
+        return SHAPE_SCALE * max(-1.0, min(1.0, frac))
 
     def score(self, legs: list[Leg] | None, c: Constraints, n_calls: int) -> Outcome:
         """Terminal reward, in strict tiers (independent of the budget, which
@@ -344,7 +411,20 @@ class Env:
         rep = replay(legs, self.w)
         if not rep.feasible:
             progress = partial_progress(legs, self.w)
-            reward = -budget - INFEASIBLE_BASE + INFEASIBLE_CREDIT * progress
+            # Two graded signals on a failed submission, and they answer
+            # different questions. partial_progress: how much of the CHAIN
+            # validated (did the trains connect). shaping: how far the journey
+            # got GEOGRAPHICALLY toward the goal. A near-miss that also ended up
+            # close to the destination scores highest within the infeasible tier;
+            # a fabricated chain going nowhere scores lowest. Both are bounded so
+            # the tier as a whole still sits strictly below any feasible route.
+            shaped = self._shaping(legs)
+            bonus = INFEASIBLE_CREDIT * progress + shaped
+            # The infeasible tier must stay strictly below the feasible floor
+            # (0.0). progress<=1 and shaped<=SHAPE_SCALE could sum past
+            # INFEASIBLE_BASE, so clip the bonus to keep the ceiling negative.
+            bonus = min(bonus, INFEASIBLE_BASE - 0.05)
+            reward = -budget - INFEASIBLE_BASE + bonus
             return Outcome(
                 reward, False, True, n_calls, rep,
                 reasons=rep.reasons, progress=progress,

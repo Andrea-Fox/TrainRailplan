@@ -84,10 +84,12 @@ def think_resolve_dest(rng, name):
 
 def think_list_departures(rng, station_name, after):
     return pick(rng, [
-        f"I'm at {station_name}. List the trains leaving here after {after} so I can "
-        f"pick one heading the right way.",
-        f"From {station_name}, see what departs after {after}.",
-        f"Check departures from {station_name} after {after} before committing to any train.",
+        f"I'm at {station_name}. List the trains leaving here after {after}; I'll "
+        f"prefer one whose terminus is closer to the destination.",
+        f"From {station_name}, see what departs after {after} and pick the one "
+        f"heading most toward the goal.",
+        f"Check departures from {station_name} after {after}, using distance-to-"
+        f"destination to rank the candidates before committing.",
     ])
 
 
@@ -160,6 +162,12 @@ class Simulator:
         o, d = inst["origin"], inst["destination"]
         ref_legs = [Leg(l["trip_id"], l["board"], l["alight"]) for l in inst["reference"]["legs"]]
 
+        # Turn on the navigational distance signal for this episode. Every
+        # departures()/leg() the simulator drives now carries km-to-destination,
+        # so the recorded observations match exactly what the policy will see at
+        # train and eval time -- and the reasoning below can refer to it.
+        self.env.set_destination(d)
+
         # 1. resolve origin
         turns.append(self._call(think_resolve_origin(rng, inst["origin_name"]),
                                  "find_station", {"query": inst["origin_name"]}))
@@ -208,10 +216,13 @@ class Simulator:
                 # the reference itself failed to validate -- should never happen;
                 # skip this instance rather than emit a broken trace.
                 return None
-            turns.append(Turn(
-                think_leg_ok(rng, leg.trip_id, self.env.names[leg.alight], r["arrives"]),
-                "_note", {},
-            ))
+            # Confirmation reasoning references the distance signal when present,
+            # so the model learns to READ it: "arrived, and it's N km closer".
+            km = r.get("to_km_to_dest")
+            confirm = think_leg_ok(rng, leg.trip_id, self.env.names[leg.alight], r["arrives"])
+            if km is not None:
+                confirm += f" That leaves me {km} km from the destination."
+            turns.append(Turn(confirm, "_note", {}))
             after = parse_arr(r["arrives"])  # next hop leaves after this arrival
 
         # final: submit

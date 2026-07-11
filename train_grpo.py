@@ -78,6 +78,7 @@ def rollout(model, tok, env: Env, inst: dict, max_calls: int,
     """Run one full episode. Returns the token sequence and a mask marking which
     tokens the policy produced (only those get a gradient)."""
     c = to_constraints(inst)
+    env.set_destination(inst["destination"])   # enable the km-to-dest signal
     messages = [{"role": "user", "content": inst["request"]}]
 
     # Grow two parallel sequences: the token ids, and a mask of policy tokens.

@@ -75,6 +75,36 @@ class World:
         self._names = dict(zip(self.stations.station_id, self.stations.stop_name))
         self._component = dict(zip(self.stations.station_id, self.stations.component))
 
+        # Coordinates, for the navigational distance signal. Some border stations
+        # lack them (geolocatable == False); distance to/from those is undefined
+        # and returned as None, never guessed.
+        self._lat: dict[str, float] = {}
+        self._lon: dict[str, float] = {}
+        geo = self.stations
+        if "geolocatable" in geo.columns:
+            geo = geo[geo.geolocatable]
+        for sid, la, lo in zip(geo.station_id, geo.stop_lat, geo.stop_lon):
+            self._lat[sid] = float(la)
+            self._lon[sid] = float(lo)
+
+    def has_coords(self, station_id: str) -> bool:
+        return station_id in self._lat
+
+    def distance_km(self, a: str, b: str) -> float | None:
+        """Great-circle distance between two stations, km. None if either lacks
+        coordinates -- feasibility never depends on this, so undefined is safe.
+
+        This is a straight-line HEURISTIC, deliberately not travel time: on a
+        branch-line network the nearest station by air is often not the nearest
+        by rail, so the signal guides search without dictating it."""
+        if a not in self._lat or b not in self._lat:
+            return None
+        from math import radians, sin, cos, asin, sqrt
+
+        la1, lo1, la2, lo2 = map(radians, (self._lat[a], self._lon[a], self._lat[b], self._lon[b]))
+        h = sin((la2 - la1) / 2) ** 2 + cos(la1) * cos(la2) * sin((lo2 - lo1) / 2) ** 2
+        return 2 * 6371.0 * asin(sqrt(h))
+
     def has_trip(self, trip_id: str) -> bool:
         return trip_id in self._trips
 

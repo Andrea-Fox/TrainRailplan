@@ -205,9 +205,12 @@ def transformers_backend(model: str, temperature: float, max_tokens: int = 3000)
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
     tok = AutoTokenizer.from_pretrained(model)
     lm = AutoModelForCausalLM.from_pretrained(
-        model, torch_dtype=torch.bfloat16, device_map="cuda"
+        model,
+        torch_dtype=torch.bfloat16 if dev == "cuda" else torch.float32,
+        device_map=dev,
     )
     lm.eval()
     if "generation %}" in (tok.chat_template or ""):
@@ -270,6 +273,7 @@ def transformers_backend(model: str, temperature: float, max_tokens: int = 3000)
 
 def run_episode(env: Env, inst: dict, call_model, max_calls: int) -> dict:
     c = to_constraints(inst)
+    env.set_destination(inst["destination"])   # enable the km-to-dest signal
     messages = [{"role": "user", "content": inst["request"]}]
     trace, n_calls = [], 0
     legs = None
