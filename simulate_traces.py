@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from env import Env, hhmm
+from headroom import to_constraints
 from replay import Leg, World
 
 
@@ -94,11 +95,23 @@ def think_list_departures(rng, station_name, after):
 
 
 def think_check_leg(rng, trip, frm, to):
+    # These explicitly contrast what departures TOLD us (the train leaves here)
+    # with what only leg() can CONFIRM (it actually reaches my alight). The model
+    # was skipping verification because the old reasoning was interchangeable
+    # boilerplate; making each one contentful -- naming the specific gap between
+    # "leaves here" and "stops where I need" -- both teaches the distinction and
+    # resists being compressed away as filler.
     return pick(rng, [
-        f"{trip} looks like it heads the right way. Before trusting it, verify with "
-        f"leg() that it actually runs {frm} -> {to} and get the times.",
-        f"Check {trip} from {frm} to {to} -- I won't submit a leg I haven't confirmed.",
-        f"Verify {trip} connects {frm} -> {to} and see when it arrives.",
+        f"Departures only tells me {trip} leaves {frm} -- not that it stops at {to}. "
+        f"I have to confirm that with leg() before it can go in the itinerary.",
+        f"{trip} appears in the departures list, but a listing isn't a confirmed leg: "
+        f"it might not call at {to} at all. Check {frm} -> {to} with leg().",
+        f"Before I trust {trip} for {frm} -> {to}, verify it with leg(). Seeing it in "
+        f"departures means it departs {frm}, not that it reaches {to}.",
+        f"I won't submit {trip} on the strength of a departures listing -- that only "
+        f"shows departures. leg() is the only thing that confirms it serves {to}.",
+        f"Check {trip} actually runs {frm} -> {to} with leg(). Departures showed it "
+        f"leaving {frm}; whether it stops at {to} is a separate fact I must verify.",
     ])
 
 
@@ -128,6 +141,32 @@ def think_submit(rng, n):
     return pick(rng, [
         f"All {n} legs are individually confirmed and they chain with time to change. Submit.",
         f"I've verified every one of the {n} legs and the transfers work. Submit the itinerary.",
+    ])
+
+
+def think_premature_submit(rng):
+    # The agent is TEMPTED to submit straight from the departures listing without
+    # confirming the last leg -- the exact mistake the trained model makes. It
+    # does so, and the retryable submit rejects it. Modelled only as a prelude to
+    # the correction below, never in isolation.
+    return pick(rng, [
+        "The departures listing shows a train that looks right for the last hop -- "
+        "let me just submit the whole thing.",
+        "This last trip appears in the departures, so I'll put it in and submit now.",
+        "I'll assume the final train from the listing works and submit the itinerary.",
+    ])
+
+
+def think_submit_rejected_recover(rng, reason):
+    # The rejection lands and the agent draws the right lesson: a departures
+    # listing is not a confirmation; verify with leg() and resubmit.
+    return pick(rng, [
+        f"Rejected -- {reason}. That's the lesson: a departures listing isn't a "
+        f"confirmed leg. I need to check it with leg() before submitting.",
+        f"Infeasible ({reason}). I submitted a leg I only saw in departures, never "
+        f"confirmed. Verify it properly with leg(), then resubmit.",
+        f"The submission bounced: {reason}. Right -- I skipped confirming that leg. "
+        f"leg() first, then submit what it confirms.",
     ])
 
 
@@ -225,7 +264,51 @@ class Simulator:
             turns.append(Turn(confirm, "_note", {}))
             after = parse_arr(r["arrives"])  # next hop leaves after this arrival
 
-        # final: submit
+        # B-pattern (~25% of multi-leg traces): before the correct submit, model
+        # the exact mistake the trained policy makes -- grab a plausible train
+        # from the departures listing WITHOUT confirming it and submit. Retryable
+        # submit rejects it; the agent recovers by verifying and resubmitting. Now
+        # that submit is retryable this is an executable pattern, and it teaches
+        # that a departures listing is not a confirmation. Kept a minority so the
+        # dominant signal stays clean verify-then-submit; the wrong submit never
+        # appears in isolation, always immediately followed by the rejection and
+        # the correction.
+        do_B = n_legs >= 2 and rng.random() < 0.25
+        if do_B:
+            # take a wrong last leg the agent "saw in departures" but never checked
+            last = ref_legs[-1]
+            wrong_trains = self._towards_dest_wrong_trains(
+                last.board, after, d, last.trip_id)
+            if wrong_trains:
+                wrong_tid = rng.choice(wrong_trains)
+                premature = [{"trip_id": l.trip_id, "board": l.board, "alight": l.alight}
+                             for l in ref_legs[:-1]]
+                premature.append({"trip_id": wrong_tid, "board": last.board,
+                                  "alight": last.alight})
+                cand = [Leg(x["trip_id"], x["board"], x["alight"]) for x in premature]
+                verdict = self.env.check_submit(cand, to_constraints(inst))
+                if not verdict.get("feasible", False):   # only if it really rejects
+                    turns.append(Turn(think_premature_submit(rng), "submit",
+                                      {"legs": premature}, verdict))
+                    reason = verdict.get("reasons", [verdict.get("error", "infeasible")])
+                    reason = reason[0] if isinstance(reason, list) and reason else "infeasible"
+                    turns.append(Turn(
+                        think_submit_rejected_recover(rng, self._reason_from_submit(reason)),
+                        "_note", {}))
+                    # now confirm the correct last leg properly with leg()
+                    turns.append(self._call(
+                        think_check_leg(rng, last.trip_id, self.env.names[last.board],
+                                        self.env.names[last.alight]),
+                        "leg", {"trip_id": last.trip_id, "board": last.board,
+                                "alight": last.alight},
+                    ))
+                    rr = turns[-1].result
+                    if "error" not in rr:
+                        turns.append(Turn(
+                            think_leg_ok(rng, last.trip_id, self.env.names[last.alight],
+                                         rr["arrives"]), "_note", {}))
+
+        # final: submit the fully-confirmed itinerary
         turns.append(Turn(
             think_submit(rng, n_legs),
             "submit",
@@ -240,6 +323,20 @@ class Simulator:
         if n_legs <= 1:
             return 0
         return n_legs - 1
+
+    def _reason_from_submit(self, reason: str) -> str:
+        """Phrase a check_submit rejection reason the way the recover-reasoning
+        expects -- same vocabulary as leg-error reasons."""
+        r = reason.lower()
+        if "does not call" in r or "not call" in r:
+            return "that train doesn't stop where I need"
+        if "does not run" in r or "not run" in r:
+            return "that train isn't running today"
+        if "other way" in r or "opposite" in r:
+            return "that train runs the wrong direction"
+        if "chain" in r or "connect" in r:
+            return "the legs don't connect in time"
+        return reason
 
     def _reason(self, result: dict) -> str:
         if "error" in result:

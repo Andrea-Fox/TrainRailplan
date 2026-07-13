@@ -119,10 +119,15 @@ def rollout(model, tok, env: Env, inst: dict, max_calls: int,
         elif call["tool"] == "submit":
             raw = call["args"].get("legs", [])
             try:
-                legs = [Leg(l["trip_id"], l["board"], l["alight"]) for l in raw]
+                cand = [Leg(l["trip_id"], l["board"], l["alight"]) for l in raw]
             except (TypeError, KeyError):
-                legs = []
-            break
+                cand = []
+            n_calls += 1
+            verdict = env.check_submit(cand, c)
+            legs = cand                       # remember for scoring
+            if verdict["feasible"]:
+                break                         # accept: terminal
+            obs = verdict                     # infeasible: recover and retry
         else:
             malformed = 0
             n_calls += 1

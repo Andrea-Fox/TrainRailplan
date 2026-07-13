@@ -417,6 +417,30 @@ class Env:
         frac = (d0 - d1) / d0
         return SHAPE_SCALE * max(-1.0, min(1.0, frac))
 
+    def check_submit(self, legs: list[Leg], c: Constraints) -> dict:
+        """Evaluate a submission WITHOUT ending the episode. Returns a feasibility
+        verdict and, if infeasible, the same kind of error observation the other
+        tools return -- so a wrong submit becomes a recoverable mistake instead of
+        a terminal gamble. The episode loop uses this to decide whether to accept
+        the submit (feasible) or hand the errors back and let the agent fix them.
+
+        Making submit retryable turns 'verify before you submit' into something the
+        environment actually enforces: a fabricated or unconfirmed leg comes back
+        rejected, exactly as if the agent had checked it with leg() -- which is the
+        lesson SFT failed to teach when every training submit succeeded.
+        """
+        if not legs:
+            return {"feasible": False, "error": "no legs submitted"}
+        rep = replay(legs, self.w)
+        if not rep.feasible:
+            return {"feasible": False, "error": "itinerary infeasible",
+                    "reasons": rep.reasons[:4]}
+        v = violations(rep, c)
+        if any(v.values()):
+            return {"feasible": True, "violations": {k: val for k, val in v.items() if val},
+                    "note": "reaches the destination but breaks a stated preference"}
+        return {"feasible": True, "arrival": hhmm(rep.arrival) if rep.arrival else None}
+
     def score(self, legs: list[Leg] | None, c: Constraints, n_calls: int) -> Outcome:
         """Terminal reward, in strict tiers (independent of the budget, which
         is subtracted uniformly from all of them):

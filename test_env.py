@@ -351,6 +351,38 @@ def _(e):
     assert o.reward < 1
 
 
+@case("retryable submit: a feasible itinerary is accepted")
+def _(e):
+    v = e.check_submit([Leg("T1", "P", "K"), Leg("T2", "K", "HB")], C(arrive_before=h(11)))
+    assert v["feasible"] is True, v
+
+
+@case("retryable submit: an infeasible itinerary is rejected with reasons")
+def _(e):
+    v = e.check_submit([Leg("T99", "P", "K")], C(arrive_before=h(11)))  # T99 doesn't exist
+    assert v["feasible"] is False, v
+    assert "reasons" in v or "error" in v, v
+
+
+@case("retryable submit: feasible-but-violating is accepted with a note")
+def _(e):
+    v = e.check_submit([Leg("T1", "P", "K"), Leg("T2", "K", "HB")], C(arrive_before=h(5)))
+    assert v["feasible"] is True, v
+    assert v.get("violations"), v
+
+
+@case("retryable submit: check_submit feasibility agrees with score()")
+def _(e):
+    for legs in (
+        [Leg("T1", "P", "K"), Leg("T2", "K", "HB")],
+        [Leg("T99", "P", "K")],
+        [Leg("T1", "P", "K"), Leg("T2", "Pa", "HB")],
+    ):
+        cs = e.check_submit(legs, C(arrive_before=h(11)))["feasible"]
+        sc = e.score(legs, C(arrive_before=h(11)), 0).feasible
+        assert cs == sc, (legs, cs, sc)
+
+
 @case("reward: strict tier ordering holds end to end")
 def _(e):
     give_up = e.score(None, C(arrive_before=h(11)), 4).reward

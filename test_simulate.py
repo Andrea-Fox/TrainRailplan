@@ -194,12 +194,38 @@ def _(env, w):
     assert not errs, "a direct train has nothing to get wrong; no dead end should be forced"
 
 
-@case("the trace ends in exactly one submit")
+@case("the trace ends in a feasible submit; any earlier submit was rejected")
 def _(env, w):
     sim = Simulator(env, w, random.Random(0))
     turns = sim.trace(INST_2LEG)
     submits = [t for t in turns if t.tool == "submit"]
-    assert len(submits) == 1 and turns[-1].tool == "submit"
+    # the LAST turn is a submit, and it is the accepted (feasible) one
+    assert turns[-1].tool == "submit", "trace must end in a submit"
+    # any submit before the last is a B-pattern premature attempt that was
+    # really rejected (feasible False) -- never a spurious extra success
+    for t in submits[:-1]:
+        assert t.result is not None and t.result.get("feasible") is False, \
+            f"non-final submit should be a rejection, got {t.result}"
+
+
+@case("B-pattern premature submit, when present, is followed by real verification")
+def _(env, w):
+    # force B by trying several seeds; confirm the structure is sound when it fires
+    for seed in range(40):
+        sim = Simulator(env, w, random.Random(seed))
+        turns = sim.trace(INST_2LEG)
+        submits = [t for t in turns if t.tool == "submit"]
+        if len(submits) == 2:
+            premature = submits[0]
+            assert premature.result.get("feasible") is False
+            # a leg() verification appears AFTER the premature submit and BEFORE the final
+            idx_prem = turns.index(premature)
+            after_prem = turns[idx_prem + 1:]
+            assert any(t.tool == "leg" for t in after_prem), \
+                "premature submit not followed by leg() verification"
+            return
+    # if B never fired across 40 seeds the rate is suspiciously low, but don't
+    # hard-fail -- it is probabilistic; the previous test still guards correctness
 
 
 @case("every assistant message carries reasoning, not just a bare call")

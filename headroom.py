@@ -313,11 +313,24 @@ def run_episode(env: Env, inst: dict, call_model, max_calls: int) -> dict:
         if call["tool"] == "submit":
             raw = call["args"].get("legs", [])
             try:
-                legs = [Leg(l["trip_id"], l["board"], l["alight"]) for l in raw]
+                cand = [Leg(l["trip_id"], l["board"], l["alight"]) for l in raw]
             except (TypeError, KeyError):
-                legs = []
-            trace.append({"tool": "submit", "args": call["args"]})
-            break
+                cand = []
+            n_calls += 1  # a submit attempt costs a call, like any other
+            verdict = env.check_submit(cand, c)
+            trace.append({"tool": "submit", "args": call["args"], "result": verdict})
+            if verdict["feasible"]:
+                legs = cand           # accept: terminal, will be scored
+                break
+            # infeasible: hand the errors back, let the agent verify and retry,
+            # until it gets a feasible submission or the budget runs out
+            messages.append(
+                {"role": "user", "content": json.dumps(verdict, ensure_ascii=False)}
+            )
+            legs = cand               # remember the last attempt for scoring on timeout
+            if n_calls >= max_calls:
+                break
+            continue
 
         n_calls += 1
         result = env.step(call["tool"], call["args"])
@@ -490,3 +503,4 @@ def report(results: list[dict], k: int):
 
 if __name__ == "__main__":
     main()
+
