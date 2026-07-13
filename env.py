@@ -357,29 +357,64 @@ class Env:
         except TypeError as e:
             return {"error": f"bad arguments for {tool}: {e}"}
 
+    def _verified_end(self, legs: list[Leg]) -> str | None:
+        """The alight station of the last leg that actually validates as a real,
+        connecting train -- walking the same checks as partial_progress and
+        stopping at the first break. This is where the journey REALLY reaches,
+        as opposed to where the submission CLAIMS to reach.
+
+        Returns the origin's board station if even the first leg is fabricated
+        (no progress made), or None if there are no legs.
+        """
+        if not legs:
+            return None
+        prev_alight = prev_arr = None
+        reached = legs[0].board            # before any verified leg, we're at the start
+        for leg in legs:
+            if not self.w.has_trip(leg.trip_id):
+                break
+            calls = self.w.calls(leg.trip_id)
+            if leg.board not in calls or leg.alight not in calls:
+                break
+            b_seq, _, b_dep = calls[leg.board]
+            a_seq, a_arr, _ = calls[leg.alight]
+            if b_seq >= a_seq:
+                break
+            if prev_alight is not None:
+                if leg.board != prev_alight or b_dep < prev_arr + self.w.min_transfer_sec:
+                    break
+            prev_alight, prev_arr = leg.alight, a_arr
+            reached = leg.alight           # this leg is real: advance the true position
+        return reached
+
     def _shaping(self, legs: list[Leg]) -> float:
         """Telescoped potential-based shaping, in [-SHAPE_SCALE, +SHAPE_SCALE].
 
-        Phi(s) = -distance(s, dest). The per-leg shaping sums to
-        Phi(alight_last) - Phi(board_first) = dist(origin,dest) - dist(end,dest),
-        normalized by dist(origin,dest) so it is scale-free across journeys:
+        Phi(s) = -distance(s, dest). Measured over the VERIFIED prefix of the
+        chain -- the legs that replay as real, connecting trains -- not the
+        submitted endpoints. This closes a blind spot: a fabricated leg still
+        names real stations with real coordinates, so measuring distance to the
+        SUBMITTED end rewarded inventing trips between well-placed stations. Run 1
+        showed the policy learned exactly that -- submit plausible stations in the
+        right geography, never verify the trips. Anchoring shaping to where the
+        journey REALLY reaches means fabrication earns nothing: the only way to
+        move Phi is to submit trips that actually exist and connect.
 
-            +SHAPE_SCALE  the chain ends AT the destination (full progress)
-             0            it ends as far from the goal as it began
-            -SHAPE_SCALE  it ends twice as far (wandered backwards), clipped
+            +SHAPE_SCALE  the verified chain reaches the destination
+             0            it verifies nothing / ends where it began
+            -SHAPE_SCALE  the verified end is farther than the origin (clipped)
 
-        Depends only on the endpoints, so loops and detours net nothing. Returns
-        0 when the destination or an endpoint lacks coordinates -- shaping is a
-        guide, never a requirement.
+        Still telescoping (endpoints only), so loops and detours net nothing.
         """
         if self._dest is None or not legs:
             return 0.0
-        origin, end = legs[0].board, legs[-1].alight
+        origin = legs[0].board
+        end = self._verified_end(legs)     # where the REAL trains actually got us
         d0 = self.w.distance_km(origin, self._dest)
-        d1 = self.w.distance_km(end, self._dest)
+        d1 = self.w.distance_km(end, self._dest) if end is not None else d0
         if d0 is None or d1 is None or d0 < 1e-6:
             return 0.0
-        frac = (d0 - d1) / d0            # 1 at the goal, 0 no progress, <0 backwards
+        frac = (d0 - d1) / d0
         return SHAPE_SCALE * max(-1.0, min(1.0, frac))
 
     def score(self, legs: list[Leg] | None, c: Constraints, n_calls: int) -> Outcome:

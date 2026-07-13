@@ -411,23 +411,42 @@ def _(e):
     e.set_destination(None)
 
 
-@case("shaping: a loop returning to origin nets zero (telescoping)")
+@case("shaping: measures the verified end, not the submitted end")
 def _(e):
     e.set_destination("HB")
-    # Ends where it began (P): dist unchanged, shaping must be ~0 regardless of
-    # any wandering in between. This is the anti-hacking property.
-    s = e._shaping([Leg("T1", "P", "K"), Leg("Tback", "K", "P")])
-    assert abs(s) < 1e-9, s
+    from env import SHAPE_SCALE
+    # A real connecting chain P->K (T1) then K->HB (T2) reaches HB: full credit.
+    real = e._shaping([Leg("T1", "P", "K"), Leg("T2", "K", "HB")])
+    assert abs(real - SHAPE_SCALE) < 1e-9, real
+    # Same first leg, then a FABRICATED second leg (T99 doesn't exist): the
+    # verified end is only K, not HB. Shaping reflects reaching K, not the
+    # fabricated claim of HB. This is the blind-spot fix: inventing a leg to a
+    # well-placed station earns nothing beyond where the real trains got you.
+    faked = e._shaping([Leg("T1", "P", "K"), Leg("T99", "K", "HB")])
+    assert faked < real, (faked, real)      # fabrication does not reach the goal
+    # and it equals just the real first leg alone
+    just_first = e._shaping([Leg("T1", "P", "K")])
+    assert abs(faked - just_first) < 1e-9, (faked, just_first)
     e.set_destination(None)
 
 
-@case("shaping: depends only on endpoints, not the path length")
+@case("shaping: a fabricated first leg earns zero (no verified progress)")
 def _(e):
     e.set_destination("HB")
-    # Two chains with the SAME origin (P) and SAME end (K) -> identical shaping,
-    # however many legs. Cannot be farmed by adding detours that return.
-    a = e._shaping([Leg("T1", "P", "K")])
-    b = e._shaping([Leg("T1", "P", "K"), Leg("Tx", "K", "P"), Leg("T1", "P", "K")])
+    # If even the first leg is invented, the journey verifiably reaches nowhere:
+    # the true position is still the origin, so no progress, no shaping.
+    s = e._shaping([Leg("T99", "P", "HB")])
+    assert s == 0.0, s
+    e.set_destination(None)
+
+
+@case("shaping: depends only on the verified endpoints, not path length")
+def _(e):
+    e.set_destination("HB")
+    # T3 (P->K) and T1 (P->K) both really reach K. Shaping depends on the
+    # verified end (K), not how the chain is written, so both give the same.
+    a = e._shaping([Leg("T3", "P", "K")])
+    b = e._shaping([Leg("T1", "P", "K")])
     assert abs(a - b) < 1e-9, (a, b)
     e.set_destination(None)
 
@@ -435,11 +454,10 @@ def _(e):
 @case("shaping: ending farther from the goal is negative")
 def _(e):
     e.set_destination("P")   # goal is the western end
-    # Start at K (east of P) and go to Pa (farther east): moves AWAY from P, so
-    # d1 > d0 and shaping is negative. (Starting at P itself would give d0=0,
-    # which the helper treats as no-signal -- the origin is never the goal in a
-    # real instance.)
-    s = e._shaping([Leg("T2", "K", "Pa")])
+    # T1 verifies P->K->Pa (a 3-stop trip). Board K, alight Pa: a real leg that
+    # moves AWAY from P (Pa is east of K). Verified end Pa is farther from P
+    # than origin K, so shaping is negative.
+    s = e._shaping([Leg("T1", "K", "Pa")])
     assert s < 0, s
     e.set_destination(None)
 
